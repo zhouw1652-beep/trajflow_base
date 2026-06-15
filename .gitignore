@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+
+# Data and outputs
+/data/*
+!/data/README.md
+!/data/make_toy_data.py
+!/data/toy_data/
+!/data/toy_data/**
+outputs/
+outputs_*/
+generate_results/
+generate_results_*/
+logs/
+analysis_outputs/
+
+# Models and large binaries
+*.pt
+*.pth
+*.pkl
+*.npy
+*.zip
+!/data/toy_data/*.pkl
+!/data/processed_coeffs_Toy_rdp_k_10.npy
+
+# IDE
+.idea/
+.vscode/
