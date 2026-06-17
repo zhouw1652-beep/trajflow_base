@@ -138,6 +138,52 @@ def generate_trajectories(model, all_gt_data, all_head, lengths, traj_mean, traj
           f"last 5 = {selected_global_indices[-5:]}")
     # ───────────────────────────────────────────────────────────────────────────
 
+    # ── Fair adapter v1: sample sparse lengths from train empirical distribution ─
+    # We must not use test original_length. The sparse length of generated.pkl
+    # sequences will be sampled from train_lengths.pkl, which is saved by
+    # prepare_mirage_trajflow_data.py and reflects the real training distribution.
+    actual_n = len(selected_local_indices)
+    input_folder = getattr(dataset, 'input_folder', None)
+    if input_folder is None:
+        raise RuntimeError(
+            "[Fair adapter] dataset.input_folder is not set; cannot locate "
+            "train_lengths.pkl. Re-run scripts/prepare_mirage_trajflow_data.py."
+        )
+    train_lengths_path = os.path.join(input_folder, 'train_lengths.pkl')
+    if not os.path.exists(train_lengths_path):
+        raise FileNotFoundError(
+            f"[Fair adapter] train_lengths.pkl not found at {train_lengths_path}. "
+            "Re-run `python scripts/prepare_mirage_trajflow_data.py --city "
+            f"{os.path.basename(os.path.normpath(input_folder))}` first."
+        )
+    with open(train_lengths_path, 'rb') as f:
+        train_lengths = list(pickle.load(f))
+    if not train_lengths:
+        raise ValueError("[Fair adapter] train_lengths.pkl is empty.")
+    train_min_len = min(train_lengths)
+    fair_seed = int(config.get('project', {}).get('seed', 42))
+    fair_rng = np.random.RandomState(fair_seed)
+    generated_lengths = fair_rng.choice(
+        train_lengths, size=actual_n, replace=True
+    ).astype(int).tolist()
+    # Safety: never go below the train minimum.
+    generated_lengths = [max(int(x), train_min_len) for x in generated_lengths]
+    print(f"[Fair adapter] Sampled {len(generated_lengths)} sparse lengths from "
+          f"train distribution (seed={fair_seed}).")
+    print(f"  train_min={train_min_len}, train_max={max(train_lengths)}")
+    print(f"  gen_min={min(generated_lengths)}, gen_max={max(generated_lengths)}, "
+          f"gen_mean={sum(generated_lengths)/len(generated_lengths):.2f}")
+    # Pre-compute z-scored total_len for each generated length.
+    # cond_mean[2] is the train mean of total_len; cond_std[2] is the train std.
+    len_mean = float(cond_mean[2])
+    len_std = float(cond_std[2])
+    if len_std <= 0:
+        raise ValueError(f"[Fair adapter] cond_std[2] (total_len) is non-positive: {len_std}")
+    generated_lengths_z = [
+        (float(x) - len_mean) / len_std for x in generated_lengths
+    ]
+    # ────────────────────────────────────────────────────────────────────────────
+
     from torch.utils.data import Subset
     dataloader = DataLoader(
         Subset(dataset, selected_local_indices),
@@ -152,6 +198,26 @@ def generate_trajectories(model, all_gt_data, all_head, lengths, traj_mean, traj
     with open(indices_map_path, 'w') as f:
         json.dump({'selected_indices': [int(x) for x in selected_global_indices]}, f)
     print(f"Saved selected_indices (global) to {indices_map_path}")
+
+    # ── Fair adapter v1: write meta file consumed by postprocess ────────────────
+    # Postprocess must use generated_lengths (NOT test original_length) for
+    # sparse length sampling. It also enforces GPS/POI snapping.
+    fair_meta = {
+        "version": "fair_adapter_v1",
+        "length_source": "train_empirical_distribution",
+        "generated_lengths": [int(x) for x in generated_lengths],
+        "distance_condition_policy": "normalized_zero_for_total_dis_avg_dis_avg_speed",
+        "time_policy": "keep_test_total_time",
+        "seed": fair_seed,
+        "train_lengths_pkl": train_lengths_path,
+        "train_min_len": int(train_min_len),
+        "train_max_len": int(max(train_lengths)),
+    }
+    fair_meta_path = os.path.join(save_dir, 'fair_adapter_meta.json')
+    with open(fair_meta_path, 'w') as f:
+        json.dump(fair_meta, f, indent=2)
+    print(f"[Fair adapter] Saved fair_adapter_meta.json to {fair_meta_path}")
+    # ───────────────────────────────────────────────────────────────────────────
 
     # Initialize inference model
     inference = FlowMatchingInference(config=config,
@@ -193,6 +259,20 @@ def generate_trajectories(model, all_gt_data, all_head, lengths, traj_mean, traj
             batch_local_indices = selected_local_indices[start_local:end_local]
             batch_global_indices = [selected_global_indices[i] for i in batch_local_indices]
             all_indices.extend(batch_global_indices)
+
+            # ── Fair adapter v1: override condition columns ─────────────────────
+            # The dataset condition loaded from conditions.pkl may contain
+            # non-zero values for total_dis / avg_dis / avg_speed (we already
+            # zeroed them in prepare, but we re-assert here as a safety net).
+            # total_len (col 3) is overridden with the value sampled from the
+            # train empirical length distribution -- this is the entire point
+            # of the fair adapter for the length axis.
+            condition_sample[:, 1] = 0.0
+            condition_sample[:, 4] = 0.0
+            condition_sample[:, 5] = 0.0
+            for k_in_batch, j_local in enumerate(batch_local_indices):
+                condition_sample[k_in_batch, 3] = float(generated_lengths_z[j_local])
+            # ───────────────────────────────────────────────────────────────────
 
             # Extract raw ground truth for these indices (use selected_global_indices)
             for gidx in batch_global_indices:

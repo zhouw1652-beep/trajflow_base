@@ -315,6 +315,7 @@ def process_sequences(sequences, poi_gps, poi_cat,
     ], dtype=np.float32)
 
     # Z-score normalize cols 1-5 for ALL sequences
+    # P1-2: Report geohash fallback statistics
     conditions = []
     for i in range(n_seqs):
         c = conditions_raw[i].copy()
@@ -322,7 +323,22 @@ def process_sequences(sequences, poi_gps, poi_cat,
             c[col_i + 1] = (c[col_i + 1] - m) / s
         conditions.append(c)
 
-    # P1-2: Report geohash fallback statistics
+    # Fair adapter v1: zero out distance-related condition columns AFTER z-score.
+    # Rationale: total_dis / avg_dis / avg_speed are derived from oracle
+    # statistics of the real test trajectory (haversine on the sparse points).
+    # Allowing the model to condition on them leaks the answer.
+    # We keep condition[2] (total_time) and condition[3] (total_len) so that
+    # the generation stage can still vary time horizon and number of points.
+    conditions_arr_raw = np.array(conditions, dtype=np.float32)
+    conditions_arr = conditions_arr_raw.copy()
+    FAIR_ZERO_COLS = [1, 4, 5]  # total_dis, avg_dis, avg_speed
+    for col in FAIR_ZERO_COLS:
+        conditions_arr[:, col] = 0.0
+    print(
+        "  Fair adapter: condition columns [1,4,5] are zeroed after z-score "
+        "normalization (total_dis, avg_dis, avg_speed)."
+    )
+
     missing_start_ratio = missing_start / n_seqs if n_seqs > 0 else 0.0
     missing_end_ratio = missing_end / n_seqs if n_seqs > 0 else 0.0
     if missing_start > 0 or missing_end > 0:
@@ -341,7 +357,6 @@ def process_sequences(sequences, poi_gps, poi_cat,
         )
 
     traj_segments_arr = np.array(traj_segments, dtype=np.float32)
-    conditions_arr = np.array(conditions, dtype=np.float32)
     return traj_segments_arr, conditions_arr, cond_mean, cond_std, metadata
 
 
@@ -395,6 +410,31 @@ def write_outputs(output_dir, traj_segments, conditions,
     with open(output_dir / 'test_metadata.pkl', 'wb') as f:
         pickle.dump(test_meta, f)
 
+    # Fair adapter v1: save train-only trajectory length distribution.
+    # Generation and postprocess will sample from this empirical distribution
+    # instead of using test original_length. The list contains the
+    # original_length of every training-split sequence (int).
+    train_lengths = [
+        int(metadata[idx]['original_length'])
+        for idx in train_idx
+    ]
+    train_lengths = [int(x) for x in train_lengths]
+    with open(output_dir / 'train_lengths.pkl', 'wb') as f:
+        pickle.dump(train_lengths, f)
+    if train_lengths:
+        n_lt = len(train_lengths)
+        n_lt_5 = sum(1 for x in train_lengths if x < 5)
+        n_lt_10 = sum(1 for x in train_lengths if x < 10)
+        hist_20 = {i: train_lengths.count(i) for i in range(1, 21)}
+        sorted_lens = sorted(train_lengths)
+        med = sorted_lens[n_lt // 2]
+        print(f"\n  Fair adapter: train_lengths.pkl saved with {n_lt} lengths.")
+        print(f"    min={min(train_lengths)}, mean={sum(train_lengths)/n_lt:.2f}, "
+              f"median={med}, max={max(train_lengths)}")
+        print(f"    count<5: {n_lt_5} ({100*n_lt_5/n_lt:.1f}%), "
+              f"count<10: {n_lt_10} ({100*n_lt_10/n_lt:.1f}%)")
+        print(f"    histogram 1..20: {hist_20}")
+
     # Sanity checks
     assert len(train_idx) + len(val_idx) + len(test_idx) == len(traj_segments)
     max_cid = int(conditions[:, 6].max())
@@ -413,6 +453,10 @@ def write_outputs(output_dir, traj_segments, conditions,
     print(f"  Grid: compact_ids [0, {n_grids}), max_used={max_cid}")
     print(f"  cond_mean (from train): {cond_mean}")
     print(f"  cond_std  (from train): {cond_std}")
+    print(f"  Fair adapter v1 active:")
+    print(f"    - condition columns [1,4,5] zeroed AFTER z-score (all splits)")
+    print(f"    - condition[2] (total_time) and condition[3] (total_len) KEPT")
+    print(f"    - train_lengths.pkl saved (generation/postprocess MUST sample from this)")
     print(f"  Departure mode: {departure_mode}")
     print(f"  NOTE: generate.py uses cond[0]*6+12 for hour_z; raw bucket in metadata.")
     print(f"  WARNING: trans_mode=0 (walk) -- MIRAGE has no transport mode.")

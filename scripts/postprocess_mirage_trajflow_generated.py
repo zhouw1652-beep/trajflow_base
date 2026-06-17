@@ -180,6 +180,28 @@ def get_poi_category(cat_dict, key):
     )
 
 
+def get_poi_gps_flexible(poi_gps, pid):
+    """Look up a POI's snapped GPS by ID, handling int/str key variations.
+
+    Returns a [lat, lon] list. Raises KeyError if the POI id is unknown.
+    """
+    candidates = [pid]
+    try:
+        candidates.append(int(pid))
+    except (TypeError, ValueError):
+        pass
+    candidates.append(str(pid))
+
+    for k in candidates:
+        if k in poi_gps:
+            return list(parse_gps_coord(poi_gps[k]))
+
+    raise KeyError(
+        f"POI id {pid!r} not found in poi_gps. "
+        f"Sample keys: {list(poi_gps.keys())[:10]}"
+    )
+
+
 def postprocess(city, explicit_csv=None, time_mode='scale_total_time', skip_gps_check=False):
     base_dir = TRAJFLOW_ROOT / "outputs" / "mirage_baseline" / city
     output_pkl = base_dir / "generated.pkl"
@@ -236,7 +258,7 @@ def postprocess(city, explicit_csv=None, time_mode='scale_total_time', skip_gps_
 
     print(f"  CSV uid count check: PASSED ({expected_count} trajectories)")
 
-    print("\n[3/7] Verifying STRICT index alignment...")
+    print("\n[3/7] Verifying STRICT index alignment and fair adapter...")
     selected_indices = load_selected_indices(csv_dir)
 
     if selected_indices is not None:
@@ -261,6 +283,50 @@ def postprocess(city, explicit_csv=None, time_mode='scale_total_time', skip_gps_
             f"selected_indices.json not found in {csv_dir}. "
             f"Cannot verify alignment. Stop. Please ensure generate.py saves selected_indices.json."
         )
+
+    # ── Fair adapter v1: load sparse-length oracle from generation folder ────────
+    # We MUST NOT use test_metadata[i]['original_length']. The fair adapter
+    # contract: sparse length comes from fair_adapter_meta.json["generated_lengths"],
+    # which was sampled from the train empirical distribution in generate.py.
+    fair_meta_path = os.path.join(csv_dir, 'fair_adapter_meta.json')
+    if not os.path.exists(fair_meta_path):
+        raise FileNotFoundError(
+            f"[Fair adapter] fair_adapter_meta.json not found in {csv_dir}. "
+            "Run `python generate.py ...` again after the fair adapter upgrade. "
+            "Falling back to test original_length is FORBIDDEN."
+        )
+    with open(fair_meta_path) as f:
+        fair_meta = json.load(f)
+    if fair_meta.get('version') != 'fair_adapter_v1':
+        raise ValueError(
+            f"[Fair adapter] Unknown fair_adapter_meta version: {fair_meta.get('version')!r}. "
+            "Expected 'fair_adapter_v1'."
+        )
+    if 'generated_lengths' not in fair_meta:
+        raise KeyError(
+            "[Fair adapter] fair_adapter_meta.json is missing 'generated_lengths'. "
+            "This means generate.py did not write the length oracle."
+        )
+    fair_lengths = [int(x) for x in fair_meta['generated_lengths']]
+    if len(fair_lengths) != expected_count:
+        raise ValueError(
+            f"[Fair adapter] fair_adapter_meta has {len(fair_lengths)} lengths "
+            f"but expected {expected_count} (test_metadata count). Stop."
+        )
+    print(f"  [Fair adapter] Loaded fair_adapter_meta.json OK")
+    print(f"    version={fair_meta.get('version')}")
+    print(f"    length_source={fair_meta.get('length_source')}")
+    print(f"    distance_condition_policy={fair_meta.get('distance_condition_policy')}")
+    print(f"    time_policy={fair_meta.get('time_policy')}")
+    print(f"    seed={fair_meta.get('seed')}")
+    print(f"    sparse length: min={min(fair_lengths)}, mean={sum(fair_lengths)/len(fair_lengths):.2f}, "
+          f"max={max(fair_lengths)}")
+    print(f"  Fair adapter active:")
+    print(f"    - sparse length from train empirical distribution")
+    print(f"    - gps written from POI-snapped coordinates")
+    print(f"    - distance-related condition columns zeroed (at prepare stage)")
+    print(f"    - time uses test total_time / current scale_total_time policy")
+    # ────────────────────────────────────────────────────────────────────────────
 
     # 4. Group CSV rows by uid
     print("\n[4/7] Grouping trajectories...")
@@ -299,7 +365,9 @@ def postprocess(city, explicit_csv=None, time_mode='scale_total_time', skip_gps_
 
     for i, uid in enumerate(all_uids):
         grp = groups[uid].reset_index(drop=True)
-        orig_len = test_metadata[i]['original_length']
+        # Fair adapter v1: sparse length comes from generate.py's train-empirical
+        # sample. We forbid falling back to test_metadata original_length.
+        orig_len = int(fair_lengths[i])
 
         # GPS points from CSV (all 120)
         gen_gps_list = [
@@ -398,8 +466,8 @@ def postprocess(city, explicit_csv=None, time_mode='scale_total_time', skip_gps_
                 dh = int(ts.dayofweek * 24 + ts.hour) % 168
                 day_hour.append(dh)
 
-        lat_out = [p[0] for p in sampled_gps]
-        lon_out = [p[1] for p in sampled_gps]
+        lat_out_raw = [p[0] for p in sampled_gps]
+        lon_out_raw = [p[1] for p in sampled_gps]
         seq_idx = test_metadata[i].get('seq_idx', i)
 
         # Section 9 sanity check: checkins must exist in poi_gps (flexible key)
@@ -425,11 +493,21 @@ def postprocess(city, explicit_csv=None, time_mode='scale_total_time', skip_gps_
                     f"Valid categories sample: {list(valid_categories)[:10]}"
                 )
 
+        # ── Fair adapter v1: snap GPS to POI coordinates ─────────────────────
+        # KDTree has matched each sampled gen GPS to a POI id. To make the
+        # generated.pkl self-consistent (checkins / marks / gps / lat / lon all
+        # agree on the same physical POI), we replace the raw continuous GPS
+        # with the POI's snapped (lat, lon) from poi_gps.
+        snapped_gps = [get_poi_gps_flexible(poi_gps, c) for c in checkins]
+        lat_out = [p[0] for p in snapped_gps]
+        lon_out = [p[1] for p in snapped_gps]
+        # ─────────────────────────────────────────────────────────────────────
+
         seq_dict = {
             'arrival_times': arrival_times,
             'marks': marks,
             'checkins': checkins,
-            'gps': sampled_gps,
+            'gps': snapped_gps,
             'day_hour': day_hour,
             'lat': lat_out,
             'lon': lon_out,
@@ -437,12 +515,27 @@ def postprocess(city, explicit_csv=None, time_mode='scale_total_time', skip_gps_
             'seq_idx': [seq_idx],
             't_start': t_start,
             't_end': t_end,
+            # Diagnostic only -- official 5D metrics do not consume this.
+            'generated_continuous_gps_debug': sampled_gps,
+            # Also keep raw snap-to-POI distance for diagnostic; not consumed.
+            '_snap_lon_lat_raw': {
+                'lat_raw': lat_out_raw,
+                'lon_raw': lon_out_raw,
+            },
         }
         generated_sequences.append(seq_dict)
 
     # 7. GPS bounds check (P1-5: lenient, summarize only)
+    # Fair adapter v1: official `gps` is snapped POI GPS (always inside city bounds),
+    # so use the continuous pre-snap GPS for the bounds diagnostic. This keeps the
+    # existing diagnostic semantics (denormalization / grid encoding sanity).
     print("\n[7/7] Computing GPS bounds check and distance statistics...")
-    traj_gps_lists = [seq['gps'] for seq in generated_sequences]
+    if all('generated_continuous_gps_debug' in seq and seq['generated_continuous_gps_debug']
+           for seq in generated_sequences):
+        traj_gps_lists = [seq['generated_continuous_gps_debug'] for seq in generated_sequences]
+        print("  Using generated_continuous_gps_debug for bounds check (POI-snapped gps always passes).")
+    else:
+        traj_gps_lists = [seq['gps'] for seq in generated_sequences]
     if skip_gps_check:
         print("  --skip_gps_check is set: skipping strict GPS bounds enforcement.")
     else:

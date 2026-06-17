@@ -108,6 +108,27 @@ def main():
         else:
             raise ValueError(msg)
 
+    # ── Diagnostic length statistics (does NOT modify metric) ──
+    print(f"\n  Length statistics (diagnostic):")
+    real_lens = [len(s.get('checkins', [])) for s in real_seqs]
+    gen_lens  = [len(s.get('checkins', [])) for s in gen_seqs]
+    if real_lens:
+        real_sorted = sorted(real_lens)
+        print(f"    real length: min={min(real_lens)}, mean={sum(real_lens)/len(real_lens):.2f}, "
+              f"median={real_sorted[len(real_lens)//2]}, max={max(real_lens)}")
+        print(f"    real count<5: {sum(1 for x in real_lens if x < 5)} "
+              f"({100*sum(1 for x in real_lens if x < 5)/len(real_lens):.1f}%)")
+    if gen_lens:
+        gen_sorted = sorted(gen_lens)
+        print(f"    gen  length: min={min(gen_lens)}, mean={sum(gen_lens)/len(gen_lens):.2f}, "
+              f"median={gen_sorted[len(gen_lens)//2]}, max={max(gen_lens)}")
+        print(f"    gen  count<5: {sum(1 for x in gen_lens if x < 5)} "
+              f"({100*sum(1 for x in gen_lens if x < 5)/len(gen_lens):.1f}%)")
+    if real_lens and gen_lens:
+        rl = sum(real_lens) / len(real_lens)
+        gl = sum(gen_lens) / len(gen_lens)
+        print(f"    length mean ratio (gen/real) = {gl/rl if rl > 0 else float('nan'):.3f}")
+
     # ── Compute 5D official metrics ──
     print(f"\n  Computing 5D JSD metrics (via get_five_official_metrics)...")
     metrics = get_five_official_metrics(real_seqs, gen_seqs, min_seq_len=min_seq_len)
